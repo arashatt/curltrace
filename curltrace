@@ -1,0 +1,122 @@
+import os
+import subprocess
+import tempfile
+import shutil
+import argparse
+import pwd
+import sys
+import signal
+
+def is_process_running(name):
+    try:
+        result = subprocess.run(['pgrep', '-f', name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def check_php_fpm():
+    fpm_names = ['php-fpm', 'php7.4-fpm', 'php8.0-fpm', 'php8.1-fpm']
+    return any(is_process_running(name) for name in fpm_names)
+
+def check_lsws():
+    return is_process_running("lsphp")
+
+def is_bpftrace_installed():
+    return shutil.which("bpftrace") is not None
+
+def is_lsof_installed():
+    return shutil.which("lsof") is not None
+
+def username_to_uid(username):
+    try:
+        return pwd.getpwnam(username).pw_uid
+    except KeyError:
+        raise ValueError(f"User '{username}' not found on this system.")
+
+def run_bpftrace_script(uid, all):
+    libcurl_path = detect_libcurl_path()
+    if not libcurl_path:
+        print("Could not find libcurl path via lsof.")
+        return
+
+    script = f"""
+uprobe:{libcurl_path}:curl_easy_setopt
+/arg1 == 10002 { "" if all else f"&& uid=={uid}"}/
+{{
+    printf("UID %d PID %d CURL handle %p set URL: %s\\n", uid, pid, arg0, str(arg2));
+}}
+"""
+    print(script)
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".bt") as f:
+        f.write(script)
+        script_path = f.name
+
+    try:
+        print(f"Running bpftrace script for UID {uid} using {libcurl_path}...")
+        subprocess.run(['bpftrace', script_path], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"bpftrace execution failed: {e}")
+    finally:
+        os.remove(script_path)
+
+def detect_libcurl_path():
+    # Use lsphp or php-fpm to detect the libcurl library path
+    binary = "lsphp" if check_lsws() else "php-fpm"
+    try:
+        pid = subprocess.run(['pgrep', '-n', binary], stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+        result = subprocess.run(['lsof', '-p', pid], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in result.stdout.splitlines():
+            if 'libcurl' in line:
+                return line.split()[-1]
+    except Exception as e:
+        print(f"Failed to detect libcurl via lsof: {e}")
+    return None
+
+def handle_exit(signum, frame):
+    print("\nExit signal received. Exiting gracefully.")
+    sys.exit(0)
+
+def main():
+    # Handle Ctrl+C (SIGINT) and Ctrl+\ (SIGQUIT) and possibly SIGTERM
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    parser = argparse.ArgumentParser(description="Check LSWS or PHP-FPM, and trace curl URL set by UID or username.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-i', '--uid', type=int, help='UID to filter curl_easy_setopt calls')
+    group.add_argument('-u', '--user', type=str, help='Username to filter curl_easy_setopt calls')
+    group.add_argument('-a', '--all', action="store_true", help='curl_easy_setopt calls of all users')
+
+
+    try:
+        args = parser.parse_args()
+
+        if not is_lsof_installed():
+            print("Error: 'lsof' is not installed. Please install it and try again.")
+            sys.exit(1)
+
+        if check_lsws():
+            print("LiteSpeed Web Server (LSWS) is running.")
+        elif check_php_fpm():
+            print("PHP-FPM is running.")
+        else:
+            print("Neither LSWS nor PHP-FPM is detected.")
+
+        if is_bpftrace_installed():
+            try:
+                uid = None if args.all else args.uid if args.uid is not None else username_to_uid(args.user)
+                run_bpftrace_script(uid, args.all)
+            except ValueError as e:
+                print(e)
+        else:
+            print("Error: 'bpftrace' is not installed.")
+
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received. Exiting.")
+        sys.exit(0)
+    except EOFError:
+        print("\nEOF received. Exiting.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()

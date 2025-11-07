@@ -1,0 +1,39 @@
+#!/usr/bin/env bpftrace
+/*
+  detect_truncate_compatible.bt
+  Detect file truncation via:
+    - open/openat with O_TRUNC
+    - truncate()
+    - ftruncate()
+  Compatible with older kernels (no openat2)
+*/
+
+BEGIN
+{
+    printf("Watching for file truncations... (Ctrl-C to stop)\n");
+    printf("%-8s | %-16s | %-5s | %-10s | %s\n",
+           "TIME(ms)", "COMM(PID)", "UID", "EVENT", "FILE");
+}
+
+tracepoint:syscalls:sys_enter_open,
+tracepoint:syscalls:sys_enter_openat
+/args->flags & 0x200/   // O_TRUNC = 0x200
+{
+    $ms = nsecs / 1000000;
+    printf("%-8d | %-16s | %-5d | %-10s | %s\n",
+           $ms, comm, uid, "O_TRUNC", str(args->filename));
+}
+
+tracepoint:syscalls:sys_enter_truncate
+{
+    $ms = nsecs / 1000000;
+    printf("%-8d | %-16s | %-5d | %-10s | %s\n",
+           $ms, comm, uid, "truncate", str(args->path));
+}
+
+tracepoint:syscalls:sys_enter_ftruncate
+{
+    $ms = nsecs / 1000000;
+    printf("%-8d | %-16s | %-5d | %-10s | fd=%d\n",
+           $ms, comm, uid, "ftruncate", args->fd);
+}
